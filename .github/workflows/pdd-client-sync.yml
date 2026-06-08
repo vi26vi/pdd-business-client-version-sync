@@ -33,6 +33,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPO: ${{ github.repository }}
+          VT_API_KEY: ${{ secrets.VT_API_KEY }}
         run: python scripts/fetch_and_release.py
 
       - name: 输出执行结果
