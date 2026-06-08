@@ -1,0 +1,42 @@
+name: 拼多多商家客户端同步
+
+on:
+  schedule:
+    # 每小时执行一次（UTC 时间，北京时间 = UTC+8）
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    # 支持手动触发
+
+permissions:
+  contents: write  # 允许创建/更新 Release 和上传 Assets
+
+jobs:
+  sync-pdd-clients:
+    name: 获取并同步拼多多客户端
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install requests
+
+      - name: 获取客户端信息并下载
+        id: fetch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
+        run: python scripts/fetch_and_release.py
+
+      - name: 输出执行结果
+        if: always()
+        run: |
+          echo "=== 执行完成 ==="
+          cat /tmp/pdd_sync_result.txt 2>/dev/null || echo "无结果文件"

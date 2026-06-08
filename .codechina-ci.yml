@@ -1,0 +1,38 @@
+# GitCode CI/CD 流水线 — 拼多多商家客户端同步
+#
+# 定时触发配置：
+#   前往 GitCode 项目 → 设置 → DevOps → 流水线计划 → 新建计划
+#   填写 Cron: 0 * * * * (每小时)
+#   时区选择 Asia/Shanghai
+#
+# 变量配置（设置 → DevOps → 变量）：
+#   GITCODE_TOKEN    必填  | 个人访问令牌（需要 api、write_repository 权限）
+#   GITCODE_DOMAIN   可选  | 默认 https://gitcode.com
+#
+# 令牌创建路径：GitCode → 设置 → 访问令牌 → 新建令牌
+
+stages:
+  - sync
+
+sync-pdd-clients:
+  stage: sync
+  image: python:3.11-slim
+  timeout: 30m
+
+  # 定时触发 & 手动触发均执行
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  allow_failure: false
+
+  before_script:
+    - pip install --no-cache-dir requests
+
+  script:
+    - python scripts/fetch_and_release_gitcode.py
+
+  artifacts:
+    when: always
+    paths:
+      - sync_result.json
+    expire_in: 7 days

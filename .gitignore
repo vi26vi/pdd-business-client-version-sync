@@ -1,0 +1,11 @@
+.workbuddy/
+.codebuddy/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+envs/
+node_modules/
+.DS_Store
+tmp/
