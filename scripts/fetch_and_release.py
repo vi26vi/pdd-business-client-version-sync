@@ -3,7 +3,7 @@
 拼多多商家客户端自动同步脚本
 - 调用拼多多内部 API 获取所有客户端的最新版本信息
 - 下载各平台客户端安装包
-- 上传/查询 VirusTotal 扫描报告
+- 上传/查询 VirusTotal 扫描报告（支持 >32MB 大文件，通过 upload_url API）
 - 通过 GitHub API 创建/更新 Release 并上传 Assets
 """
 
@@ -26,11 +26,10 @@ PDD_REFERER = "https://mms.pinduoduo.com/other/download_app"
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 GITHUB_REPO = os.environ["GITHUB_REPO"]
 
-VT_API_KEY = os.environ.get("VT_API_KEY", "")
-VT_API_URL = "https://www.virustotal.com/api/v3"
-VT_UPLOAD_LIMIT = 32 * 1024 * 1024   # 32MB 免费 API 上传限制
+VT_API_KEY   = os.environ.get("VT_API_KEY", "")
+VT_API_URL   = "https://www.virustotal.com/api/v3"
 VT_POLL_INTERVAL = 15   # 轮询间隔（秒）
-VT_POLL_TIMEOUT = 180   # 最长等待（秒）
+VT_POLL_TIMEOUT  = 300  # 最长等待（秒），大文件扫描时间更长
 
 PLATFORM_MAP = {
     1: {"name": "android", "ext": ".apk",  "emoji": "📱", "label": "Android"},
@@ -39,7 +38,7 @@ PLATFORM_MAP = {
     4: {"name": "macos",   "ext": ".dmg",  "emoji": "🍏", "label": "macOS"},
 }
 
-RESULT_FILE = "/tmp/pdd_sync_result.txt"
+RESULT_FILE  = "/tmp/pdd_sync_result.txt"
 DOWNLOAD_DIR = Path("/tmp/pdd_downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
@@ -76,7 +75,7 @@ def vt_headers() -> dict:
 
 
 # ──────────────────────────────────────────
-# VirusTotal 操作
+# VirusTotal 操作（支持大文件）
 # ──────────────────────────────────────────
 
 def vt_get_report(sha256: str):
@@ -92,7 +91,7 @@ def vt_get_report(sha256: str):
             log("  [VT] ✅ 找到已有报告")
             return r.json()["data"]
         elif r.status_code == 404:
-            log("  [VT] 无已有报告（404）")
+            log("  [VT] 无已有报告（404），需要上传")
             return None
         else:
             log(f"  [VT] 查询失败: {r.status_code} {r.text[:100]}")
@@ -102,26 +101,75 @@ def vt_get_report(sha256: str):
         return None
 
 
+def vt_get_upload_url() -> str | None:
+    """
+    获取大文件上传专用 URL（/api/v3/files/upload_url）。
+    每个 URL 仅限使用一次。
+    """
+    log("  [VT] 获取大文件上传 URL ...")
+    try:
+        r = requests.get(
+            f"{VT_API_URL}/files/upload_url",
+            headers=vt_headers(),
+            timeout=30,
+        )
+        r.raise_for_status()
+        url = r.json()["data"]
+        log(f"  [VT] 获取到上传 URL（将于首次使用后失效）")
+        return url
+    except Exception as e:
+        log(f"  [VT] 获取上传 URL 失败: {e}")
+        return None
+
+
 def vt_upload_file(file_path: Path):
     """
-    上传文件到 VirusTotal，返回 analysis_id。
-    仅在文件 ≤ 32MB 时调用。
+    上传文件到 VirusTotal，自动选择上传方式：
+    - ≤ 32MB  ：直接 POST /files
+    - > 32MB   ：先 GET /files/upload_url，再 POST 到返回的上传 URL
+    返回 analysis_id。
     """
-    log(f"  [VT] 上传文件: {file_path.name} ({format_size(file_path.stat().st_size)})")
+    file_size = file_path.stat().st_size
+    log(f"  [VT] 上传文件: {file_path.name} ({format_size(file_size)})")
+
     try:
-        with open(file_path, "rb") as f:
-            r = requests.post(
-                f"{VT_API_URL}/files",
-                headers={"x-apikey": VT_API_KEY},
-                files={"file": (file_path.name, f, "application/octet-stream")},
-                timeout=120,
-            )
-        r.raise_for_status()
-        analysis_id = r.json()["data"]["id"]
-        log(f"  [VT] 上传成功，analysis_id: {analysis_id[:30]}...")
-        return analysis_id
+        # ── 方式 A：小文件直接上传 ──────────────────────
+        if file_size <= 32 * 1024 * 1024:
+            log("  [VT] 使用直接上传（≤ 32MB）...")
+            with open(file_path, "rb") as f:
+                r = requests.post(
+                    f"{VT_API_URL}/files",
+                    headers={"x-apikey": VT_API_KEY},
+                    files={"file": (file_path.name, f, "application/octet-stream")},
+                    timeout=120,
+                )
+            r.raise_for_status()
+            analysis_id = r.json()["data"]["id"]
+            log(f"  [VT] ✅ 上传成功，analysis_id: {analysis_id[:30]}...")
+            return analysis_id
+
+        # ── 方式 B：大文件 → 先获取 upload_url ─────────
+        else:
+            log("  [VT] 使用 upload_url 上传（> 32MB）...")
+            upload_url = vt_get_upload_url()
+            if not upload_url:
+                log("  [VT] ❌ 无法获取上传 URL，中止上传")
+                return None
+
+            with open(file_path, "rb") as f:
+                r = requests.post(
+                    upload_url,
+                    headers={"x-apikey": VT_API_KEY},
+                    files={"file": (file_path.name, f, "application/octet-stream")},
+                    timeout=600,   # 大文件上传超时设长
+                )
+            r.raise_for_status()
+            analysis_id = r.json()["data"]["id"]
+            log(f"  [VT] ✅ 大文件上传成功，analysis_id: {analysis_id[:30]}...")
+            return analysis_id
+
     except Exception as e:
-        log(f"  [VT] 上传失败: {e}")
+        log(f"  [VT] ❌ 上传失败: {e}")
         return None
 
 
@@ -133,7 +181,7 @@ def vt_poll_analysis(analysis_id: str):
         try:
             r = requests.get(url, headers=vt_headers(), timeout=30)
             if r.status_code == 200:
-                data = r.json()["data"]
+                data   = r.json()["data"]
                 status = data["attributes"]["status"]
                 log(f"  [VT] 分析状态: {status}")
                 if status == "completed":
@@ -148,37 +196,33 @@ def vt_poll_analysis(analysis_id: str):
             log(f"  [VT] 轮询异常: {e}")
         time.sleep(VT_POLL_INTERVAL)
 
-    log("  [VT] ⚠️ 轮询超时")
+    log("  [VT] ⚠️ 轮询超时（{VT_POLL_TIMEOUT}s）")
     return None
 
 
 def vt_process_file(file_path: Path, sha256: str):
     """
     处理单个文件：
-    1. 查已有报告 → 有则返回报告 URL
-    2. 无报告且文件 ≤ 32MB → 上传并等待结果
-    3. 无报告且文件 > 32MB → 返回 None
+    1. 查已有报告 → 有则直接返回报告 URL
+    2. 无报告    → 上传文件（自动适配大小），等待扫描完成
     """
     # 步骤1：查已有报告
     report = vt_get_report(sha256)
     if report:
         return f"https://www.virustotal.com/gui/file/{sha256}/detection"
 
-    # 步骤2：无报告，尝试上传（仅 ≤ 32MB）
-    file_size = file_path.stat().st_size
-    if file_path.exists() and file_size <= VT_UPLOAD_LIMIT:
-        log(f"  [VT] 文件 {format_size(file_size)} ≤ 32MB，开始上传...")
+    # 步骤2：无报告，上传文件
+    if file_path.exists():
+        file_size = file_path.stat().st_size
+        log(f"  [VT] 开始上传文件（{format_size(file_size)}）...")
         analysis_id = vt_upload_file(file_path)
         if analysis_id:
             report = vt_poll_analysis(analysis_id)
             if report:
                 return f"https://www.virustotal.com/gui/file/{sha256}/detection"
-    elif not file_path.exists():
+    else:
         # iOS 没有文件，只查报告
         pass
-    else:
-        log(f"  [VT] ⚠️ 文件 {format_size(file_size)} > 32MB，免费 API 无法上传")
-        log(f"  [VT]   请在 VirusTotal 网站手动上传，或等待社区上传")
 
     return None
 
@@ -247,7 +291,7 @@ def download_file(url: str, dest: Path, timeout: int = 300) -> bool:
 # 步骤3：GitHub Release 操作
 # ──────────────────────────────────────────
 
-GH_API = "https://api.github.com"
+GH_API     = "https://api.github.com"
 GH_HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
     "Accept": "application/vnd.github+json",
@@ -269,10 +313,10 @@ def get_or_create_release(tag: str, release_name: str, body: str) -> dict:
         log(f"创建新 Release: {tag}")
         create_url = f"{GH_API}/repos/{GITHUB_REPO}/releases"
         payload = {
-            "tag_name": tag,
-            "name": release_name,
-            "body": body,
-            "draft": False,
+            "tag_name":   tag,
+            "name":       release_name,
+            "body":       body,
+            "draft":      False,
             "prerelease": False,
             "make_latest": "true",
         }
@@ -310,7 +354,7 @@ def upload_asset(release: dict, file_path: Path, asset_name: str):
             f"{upload_url}?name={asset_name}",
             headers=headers,
             data=f,
-            timeout=300,
+            timeout=600,
         )
     r.raise_for_status()
     log("  ✅ 上传成功")
@@ -324,9 +368,9 @@ def upload_asset(release: dict, file_path: Path, asset_name: str):
 def upload_index_json(release: dict, extra_info: list):
     index = {
         "generated_at": datetime.now(CST).isoformat(),
-        "source_api": PDD_API_URL,
+        "source_api":  PDD_API_URL,
         "virustotal_api_enabled": True,
-        "clients": extra_info,
+        "clients":    extra_info,
     }
     index_path = DOWNLOAD_DIR / "pdd_clients_index.json"
     index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -338,48 +382,51 @@ def upload_index_json(release: dict, extra_info: list):
 # ──────────────────────────────────────────
 
 def main():
-    results = []
+    results    = []
     vt_results = {}   # {platform_type: report_url or None}
-    run_time = datetime.now(CST)
+    run_time   = datetime.now(CST)
 
     # 1. 获取客户端信息
     packs = fetch_pack_list()
 
     # 2. 整理信息，构建 Release tag / body
-    client_infos = []
+    client_infos   = []
     changelog_lines = [
         f"## 拼多多商家客户端最新版本",
         f"",
         f"> 自动同步时间：{run_time.strftime('%Y年%m月%d日 %H:%M')} (CST)",
         f"> 数据来源：[拼多多商家后台]({PDD_REFERER})",
-        f"> VirusTotal 扫描报告由社区 API 自动查询/上传",
+        f"> VirusTotal 扫描报告由社区 API 自动查询/上传（支持 ≤650MB 大文件）",
         f"",
         f"| 平台 | 版本 | 更新日期 | 更新内容 | VirusTotal 报告 |",
         f"|------|------|----------|----------|-----------------|",
     ]
 
     # 第一遍：计算文件名，下载，VT 扫描
+    # 文件名格式：PddWorkbenchSetup-{platform}-{version}{ext}
     file_meta = []  # (pack, meta, asset_name, dest, sha256, vt_url)
     for pack in packs:
-        t = pack["type"]
-        meta = PLATFORM_MAP.get(t, {"name": f"type{t}", "ext": "", "emoji": "📦", "label": f"type{t}"})
+        t          = pack["type"]
+        meta       = PLATFORM_MAP.get(
+            t,
+            {"name": f"type{t}", "ext": "", "emoji": "📦", "label": f"type{t}"}
+        )
         updated_at = datetime.fromtimestamp(pack["updatedAt"] / 1000, tz=CST)
-        date_str = updated_at.strftime("%Y-%m-%d")
-        content = pack.get("content", "").strip()
-        version = pack["version"]
-        ext = meta["ext"]
+        date_str   = updated_at.strftime("%Y-%m-%d")
+        content    = pack.get("content", "").strip()
+        version    = pack["version"]
+        ext        = meta["ext"]
 
-        # 文件名：pdd-business-client-{platform}-{version}{ext}
-        asset_name = f"pdd-business-client-{meta['name']}-{version}{ext}"
-        dest = DOWNLOAD_DIR / asset_name
+        # 文件名：PddWorkbenchSetup-{platform}-{version}{ext}
+        asset_name = f"PddWorkbenchSetup-{meta['name']}-{version}{ext}"
+        dest       = DOWNLOAD_DIR / asset_name
 
-        vt_url = None
-        sha256 = None
+        vt_url  = None
+        sha256  = None
 
         if t == 2:
-            # iOS：无文件，仅记录 App Store 链接，尝试用 URL 查 VT
+            # iOS：无文件，仅记录 App Store 链接
             log(f"[iOS] App Store 链接: {pack['url']} — 跳过下载")
-            # iOS 没有文件哈希可查，VT 不支持 URL 直接查询 App Store
             results.append(f"[iOS] App Store: {pack['url']} (版本 {version})")
         else:
             # 下载文件
@@ -390,7 +437,7 @@ def main():
                 # 上传 .sha256 校验文件
                 sha_path = DOWNLOAD_DIR / f"{asset_name}.sha256"
                 sha_path.write_text(f"{sha256}  {asset_name}\n")
-                # VirusTotal 处理
+                # VirusTotal 处理（自动适配文件大小）
                 log(f"  [VT] 开始处理 VirusTotal ...")
                 vt_url = vt_process_file(dest, sha256)
                 if vt_url:
@@ -403,41 +450,45 @@ def main():
 
         # 记录到 file_meta
         file_meta.append({
-            "pack": pack,
-            "meta": meta,
+            "pack":       pack,
+            "meta":       meta,
             "asset_name": asset_name,
-            "dest": dest,
-            "sha256": sha256,
-            "vt_url": vt_url,
-            "date_str": date_str,
-            "content": content,
-            "version": version,
+            "dest":       dest,
+            "sha256":     sha256,
+            "vt_url":     vt_url,
+            "date_str":   date_str,
+            "content":    content,
+            "version":    version,
         })
 
         # 记录到 client_infos（用于 JSON 索引）
         client_infos.append({
-            "type": t,
-            "platform": meta["label"],
-            "version": version,
-            "url": pack["url"],
-            "content": content,
-            "updated_at": updated_at.isoformat(),
-            "sha256": sha256,
+            "type":           t,
+            "platform":       meta["label"],
+            "version":        version,
+            "url":            pack["url"],
+            "content":        content,
+            "updated_at":     updated_at.isoformat(),
+            "sha256":         sha256,
             "virustotal_url": vt_url,
         })
 
     # 构建表格行
     for fm in file_meta:
-        pack = fm["pack"]
-        meta = fm["meta"]
-        vt_badge = vt_make_badge(fm["vt_url"], fm["sha256"]) if fm["sha256"] else "N/A（iOS App Store）"
+        pack     = fm["pack"]
+        meta     = fm["meta"]
+        vt_badge = vt_make_badge(fm["vt_url"], fm["sha256"]) if fm["sha256"] \
+            else "N/A（iOS App Store）"
         changelog_lines.append(
-            f"| {meta['emoji']} {meta['label']} | `{fm['version']}` "
-            f"| {fm['date_str']} | {fm['content']} | {vt_badge} |"
+            f"| {meta['emoji']} {meta['label']} "
+            f"| `{fm['version']}` "
+            f"| {fm['date_str']} "
+            f"| {fm['content']} "
+            f"| {vt_badge} |"
         )
 
     # Release tag 格式：pdd-clients-YYYYMMDD-HHMM
-    tag = f"pdd-clients-{run_time.strftime('%Y%m%d-%H%M')}"
+    tag         = f"pdd-clients-{run_time.strftime('%Y%m%d-%H%M')}"
     release_name = f"拼多多商家客户端 · {run_time.strftime('%Y-%m-%d %H:%M')} CST"
 
     changelog_lines += [
@@ -448,11 +499,11 @@ def main():
         "",
         "| 文件名 | 说明 |",
         "|--------|------|",
-        "| `pdd-business-client-android-*.apk` | Android 安装包 |",
-        "| `pdd-business-client-windows-*.exe` | Windows 安装程序 |",
-        "| `pdd-business-client-macos-*.dmg` | macOS 安装包 |",
-        "| `*.sha256` | SHA256 校验文件 |",
-        "| `pdd_clients_index.json` | 完整版本信息索引（含原始下载地址、SHA256、VT报告链接） |",
+        "| `PddWorkbenchSetup-android-*.apk` | Android 安装包 |",
+        "| `PddWorkbenchSetup-windows-*.exe` | Windows 安装程序 |",
+        "| `PddWorkbenchSetup-macos-*.dmg`   | macOS 安装包 |",
+        "| `*.sha256`                          | SHA256 校验文件 |",
+        "| `pdd_clients_index.json`            | 完整版本信息索引（含原始下载地址、SHA256、VT报告链接） |",
         "",
         "> **iOS** 版本通过 App Store 分发，无独立安装包，请直接前往 App Store 下载。",
         "",
@@ -462,23 +513,24 @@ def main():
         "",
         "- 所有安装包均通过 VirusTotal API 自动查询/上传扫描",
         "- 报告链接如上表「VirusTotal 报告」列",
-        "- 若显示「暂无报告」，表示该文件尚未被 VirusTotal 社区收录，或文件大于 32MB（免费 API 限制）",
-        "- 可在 [VirusTotal 官网](https://www.virustotal.com) 手动上传查询",
+        "- 免费 API 支持上传最大 **650MB** 的文件（通过 `/files/upload_url` 接口）",
+        "- 若显示「暂无报告」，表示该文件尚未被 VirusTotal 社区收录且首次上传后扫描未完成",
+        "- 可在 [VirusTotal 官网](https://www.virustotal.com) 手动查看",
     ]
     body = "\n".join(changelog_lines)
 
     # 3. 创建/获取 Release
-    release = get_or_create_release(tag, release_name, body)
+    release    = get_or_create_release(tag, release_name, body)
     release_id = release["id"]
     log(f"Release ID: {release_id}, URL: {release.get('html_url', '')}")
 
     # 4. 遍历上传 Assets
     for fm in file_meta:
-        t = fm["pack"]["type"]
+        t    = fm["pack"]["type"]
         if t == 2:
             continue  # iOS 无文件
 
-        dest = fm["dest"]
+        dest       = fm["dest"]
         asset_name = fm["asset_name"]
 
         if dest.exists():
