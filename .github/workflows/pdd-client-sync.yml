@@ -2,8 +2,8 @@ name: 拼多多商家客户端同步
 
 on:
   schedule:
-    # 每小时执行一次（UTC 时间，北京时间 = UTC+8）
-    - cron: '0 * * * *'
+    # 每天北京时间 20:00 执行（UTC 12:00）
+    - cron: '0 12 * * *'
   workflow_dispatch:
     # 支持手动触发
 
